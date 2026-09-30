@@ -25,6 +25,7 @@
 #include <cufft.h>
 #include <complex>
 #include <csignal>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,14 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void handleSigint(int) { g_stop = 1; }
+// Circular IQ history buffer.  After each block's M new samples are
+// converted from SC16Q11 they are pushed here so that on detection we can
+// extract ±60,000 samples around the peak lag from the continuous stream,
+// regardless of where the peak falls within the FFT window.
+static constexpr int     HIST_SAMPLES = 131072;   // 2^17 > 2*60000+1
+static cufftComplex      g_iqHistory[HIST_SAMPLES];
+static int               g_histHead  = 0;    // next write slot (circular)
+static int64_t           g_histTotal = 0;    // total samples pushed
 
 static bool checkBladerf(int status, const char* what) {
     if (status != 0) {
@@ -502,6 +511,18 @@ int main(int argc, char** argv) {
     int status = bladerf_open(&dev, nullptr); // nullptr = first available device
     if (!checkBladerf(status, "bladerf_open")) return 1;
 
+    // Lock the onboard VCTCXO to an external 10 MHz reference fed into the
+    // bladeRF's CLKIN SMA port.  The ADF4002 reference PLL disciplines the
+    // VCTCXO so the LO and sample clock are steered by the external reference
+    // rather than free-running.  The VCTCXO remains the actual clock source;
+    // the PLL just phase-locks it.  Must be called before set_sample_rate /
+    // set_frequency so the synthesizer programs against the locked oscillator.
+    status = bladerf_set_pll_enable(dev, true);
+    if (!checkBladerf(status, "set_pll_enable")) return 1;
+
+    status = bladerf_set_pll_refclk(dev, 10000000UL);   // 10 MHz reference
+    if (!checkBladerf(status, "set_pll_refclk")) return 1;
+
     status = bladerf_set_sample_rate(dev, rxChan, sampleRate, nullptr);
     if (!checkBladerf(status, "set_sample_rate")) return 1;
 
@@ -581,7 +602,6 @@ int main(int argc, char** argv) {
         fprintf(logFile, "Run started: %s\n", timeBuf);
         fflush(logFile);
     }
-
     printf("Streaming from bladeRF A4... Ctrl-C to stop. "
            "fftSize=%d codeLen=%d validLen(M)=%d bank=%d\n", N, L, M, numCodes);
 
@@ -592,10 +612,17 @@ int main(int argc, char** argv) {
     while (!g_stop) {
         status = bladerf_sync_rx(dev, sc16Buf.data(), (unsigned int)M, nullptr, timeoutMs);
         if (status != 0) {
-            fprintf(stderr, "bladerf_sync_rx error: %s\n", bladerf_strerror(status));
-            // BLADERF_ERR_TIMEOUT here typically means an overrun upstream;
-            // for production, track and log these explicitly rather than
-            // just continuing.
+            fprintf(stderr, "bladerf_sync_rx error: %s (buffer=%u) — clearing history\n",
+                    bladerf_strerror(status), bufferNum);
+            fprintf(logFile, "bladerf_sync_rx error: %s (buffer=%u) — clearing history\n",
+                    bladerf_strerror(status), bufferNum);
+            fflush(logFile);
+            // Zero the overlap history so the next block does not correlate
+            // new samples against stale, temporally discontinuous data.
+            // One block of correlation output will be unreliable (the first
+            // block after recovery), but the algorithm reconverges immediately
+            // because the history is now consistent with the incoming stream.
+            std::memset(h_ring, 0, sizeof(cufftComplex) * (L - 1));
             continue;
         }
 
@@ -607,6 +634,15 @@ int main(int argc, char** argv) {
             newSamples[n].x = sc16Buf[2 * n]     * scale;
             newSamples[n].y = sc16Buf[2 * n + 1] * scale;
         }
+
+        // Push the M new float32 samples into the IQ history ring buffer
+        // before processBlock so detection logic can read them by absolute
+        // stream position.
+        for (int n = 0; n < M; ++n) {
+            g_iqHistory[g_histHead] = newSamples[n];
+            if (++g_histHead == HIST_SAMPLES) g_histHead = 0;
+        }
+        g_histTotal += M;
 
         // d_ring is the same physical memory the GPU can read directly
         // (mapped pinned memory) — processBlock() reads straight from it,
@@ -622,11 +658,79 @@ int main(int argc, char** argv) {
         // threshold derived from your templates' actual energy and a
         // measured noise floor before trusting detections.
         const float threshold = 200.0f * M;
+        const float invN      = 1.0f / static_cast<float>(N);
+        static constexpr int HALF_WIN = 60000;
+
+        // Correlation buffer reused across all detecting codes this block.
+        std::vector<cufftComplex> corrBuf;
+
         for (int c = 0; c < numCodes; ++c) {
-            if (peakMag[c] > threshold) {
-                printf("code %2d: peak=%.1f lag=%d buffer=%u\n", c, peakMag[c], peakLag[c], bufferNum);
-                fprintf(logFile, "code %2d: peak=%.1f lag=%d buffer=%u\n", c, peakMag[c], peakLag[c], bufferNum);
-                fflush(logFile);
+            if (peakMag[c] <= threshold) continue;
+
+            printf("code %2d: peak=%.1f lag=%d buffer=%u\n", c, peakMag[c], peakLag[c], bufferNum);
+            fprintf(logFile, "code %2d: peak=%.1f lag=%d buffer=%u\n", c, peakMag[c], peakLag[c], bufferNum);
+            fflush(logFile);
+
+            // Absolute stream index of the peak sample.  The M new samples
+            // of this block are the most recently pushed to g_iqHistory, so
+            // the peak (at lag peakLag[c] within the valid region) sits at
+            // g_histTotal - M + peakLag[c].
+            const int64_t peakAbs = g_histTotal - M + peakLag[c];
+            const int64_t oldest  = g_histTotal - HIST_SAMPLES;
+
+            // --- IQ CSV: raw stream samples, peak ± HALF_WIN ---
+            {
+                char fname[96];
+                snprintf(fname, sizeof(fname),
+                         "iq_c%02d_buf%010u_lag%05d.csv", c, bufferNum, peakLag[c]);
+                FILE* f = fopen(fname, "w");
+                if (!f) {
+                    fprintf(stderr, "Cannot open %s\n", fname);
+                } else {
+                    fprintf(f, "lag_offset,I,Q\n");
+                    for (int off = -HALF_WIN; off <= HALF_WIN; ++off) {
+                        const int64_t pos = peakAbs + off;
+                        float I = 0.0f, Q = 0.0f;
+                        if (pos >= oldest && pos < g_histTotal) {
+                            // Map absolute index to circular-buffer slot.
+                            int64_t delta = pos - g_histTotal; // in [-HIST_SAMPLES, -1]
+                            int slot = (int)((g_histHead + (int)(delta % HIST_SAMPLES)
+                                             + HIST_SAMPLES) % HIST_SAMPLES);
+                            I = g_iqHistory[slot].x;
+                            Q = g_iqHistory[slot].y;
+                        }
+                        fprintf(f, "%d,%.8g,%.8g\n", off, I, Q);
+                    }
+                    fclose(f);
+                    printf("  [iq]   wrote %s\n", fname);
+                }
+            }
+
+            // --- Correlation CSV: complex output, all M valid lags ---
+            // The valid region spans lags 0..M-1.  Since M ≈ 41 k < 120 k,
+            // every valid lag falls within ±HALF_WIN of any peak, so we
+            // always write all M rows; lag_offset = lag - peak_lag.
+            {
+                if (corrBuf.empty()) corrBuf.resize((size_t)N);
+                bank.getLastCorrelation(c, corrBuf.data());
+
+                char fname[96];
+                snprintf(fname, sizeof(fname),
+                         "corr_c%02d_buf%010u_lag%05d.csv", c, bufferNum, peakLag[c]);
+                FILE* f = fopen(fname, "w");
+                if (!f) {
+                    fprintf(stderr, "Cannot open %s\n", fname);
+                } else {
+                    fprintf(f, "lag,lag_offset,corr_real,corr_imag\n");
+                    for (int k = 0; k < M; ++k) {
+                        const cufftComplex& s = corrBuf[(size_t)(L - 1 + k)];
+                        fprintf(f, "%d,%d,%.8g,%.8g\n",
+                                k, k - peakLag[c],
+                                s.x * invN, s.y * invN);
+                    }
+                    fclose(f);
+                    printf("  [corr] wrote %s\n", fname);
+                }
             }
         }
 

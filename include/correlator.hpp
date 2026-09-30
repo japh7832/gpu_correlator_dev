@@ -21,6 +21,19 @@ public:
     // peak correlation magnitude and lag (0..M-1) for each code.
     void processBlock(const cufftComplex* d_blockInput, float* outMag, int* outLag);
 
+    // Diagnostic: copy the full N-sample IFFT output for one code back to
+    // the host. Must be called AFTER processBlock() and BEFORE the next
+    // processBlock() call (d_product is overwritten each block).
+    //
+    // hostBuf must hold at least fftSize() cufftComplex elements.
+    // The correlation is the unnormalized cuFFT IFFT output — divide each
+    // sample by fftSize() to get the true linear cross-correlation value.
+    // The valid (non-wraparound) region is samples [codeLen()-1 .. fftSize()-1],
+    // i.e. indices L-1 through N-1 (0-indexed). Those M = N-L+1 samples are
+    // what peakSearchKernel scans, and lag k (0-indexed) corresponds to
+    // hostBuf[L-1+k] after normalization.
+    void getLastCorrelation(int codeIdx, cufftComplex* hostBuf) const;
+
 private:
     static void conjugateInPlace(cufftComplex* d_data, int n);
     int L, N, M, numCodes;

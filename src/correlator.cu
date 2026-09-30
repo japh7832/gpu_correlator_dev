@@ -241,3 +241,23 @@ void GpuCorrelatorBank::conjugateInPlace(cufftComplex* d_data, int n) {
     conjugateKernel<<<blocks, threads>>>(d_data, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+// Diagnostic readback: copy the full N-sample IFFT output (d_product row
+// for codeIdx) to a host buffer.  Call after processBlock(); the data is
+// valid until the next processBlock() call overwrites d_product.
+//
+// The values are the unnormalized cuFFT IFFT output (each true correlation
+// value is hostBuf[i] / N).  The valid linear-correlation region is
+// samples [L-1, N) (0-indexed); samples [0, L-1) are circular-wraparound
+// artefacts from the overlap-save algorithm and should be discarded.
+void GpuCorrelatorBank::getLastCorrelation(int codeIdx, cufftComplex* hostBuf) const {
+    if (codeIdx < 0 || codeIdx >= numCodes) {
+        throw std::out_of_range("getLastCorrelation: codeIdx out of range");
+    }
+    // d_product layout: [numCodes][N], row-major.
+    CUDA_CHECK(cudaMemcpy(
+        hostBuf,
+        d_product + (size_t)codeIdx * N,
+        sizeof(cufftComplex) * N,
+        cudaMemcpyDeviceToHost));
+}
