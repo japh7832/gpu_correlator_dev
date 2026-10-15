@@ -199,14 +199,18 @@ void GpuCorrelatorBank::loadCode(int idx, const cufftComplex* hostCode) {
     cudaFree(d_scratch);
 }
 
-// Process one overlap-save block. `d_blockInput` must point to N
-// time-domain samples already staged on the GPU (the last L-1 samples
+// Process one overlap-save block. `h_blockInput` must point to N
+// time-domain samples in HOST pinned memory (the last L-1 samples
 // of the previous block followed by M new samples) — see host loop
 // for how the ring buffer maintains this overlap.
+// Using cudaMemcpyHostToDevice (not DeviceToDevice) ensures the GPU
+// sees the CPU's freshly written samples through the cache-coherent
+// DMA path — required on Orin Nano's unified memory to avoid reading
+// stale CPU-cached data and producing ghost correlation peaks.
 // Results land in host arrays outMag/outLag, length numCodes.
-void GpuCorrelatorBank::processBlock(const cufftComplex* d_blockInput, float* outMag, int* outLag) {
-    CUDA_CHECK(cudaMemcpyAsync(d_inputTime, d_blockInput, sizeof(cufftComplex) * N,
-                                cudaMemcpyDeviceToDevice, stream));
+void GpuCorrelatorBank::processBlock(const cufftComplex* h_blockInput, float* outMag, int* outLag) {
+    CUDA_CHECK(cudaMemcpyAsync(d_inputTime, h_blockInput, sizeof(cufftComplex) * N,
+                                cudaMemcpyHostToDevice, stream));
 
     CUFFT_CHECK(cufftExecC2C(fwdPlan, d_inputTime, d_inputSpectrum, CUFFT_FORWARD));
 

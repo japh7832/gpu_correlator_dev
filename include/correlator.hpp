@@ -15,11 +15,13 @@ public:
 
     void loadCode(int idx, const cufftComplex* hostCode);
 
-    // d_blockInput: N complex samples already on the GPU
+    // h_blockInput: N complex samples in HOST (pinned) memory
     // (last L-1 samples from previous block + M new samples).
+    // Uses cudaMemcpyHostToDevice so the GPU sees the CPU's freshly
+    // written samples via the cache-coherent DMA path on Orin Nano.
     // outMag/outLag: host arrays, length bankSize(), receive the
     // peak correlation magnitude and lag (0..M-1) for each code.
-    void processBlock(const cufftComplex* d_blockInput, float* outMag, int* outLag);
+    void processBlock(const cufftComplex* h_blockInput, float* outMag, int* outLag);
 
     // Diagnostic: copy the full N-sample IFFT output for one code back to
     // the host. Must be called AFTER processBlock() and BEFORE the next
