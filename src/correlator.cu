@@ -74,14 +74,14 @@ __global__ void batchedComplexMultiplyKernel(
 }
 
 // Per-code peak-magnitude search over the "valid" (non-wraparound)
-// portion of the overlap-save output: samples [L-1, fftSize) map to
-// valid linear-correlation lags. One block per code; block-wide
+// portion of the overlap-save output: first M samples [0, M) are valid
+// for cross-correlation (conj(FFT(h)) form). One block per code; block-wide
 // reduction in shared memory.
 __global__ void peakSearchKernel(
     const cufftComplex* __restrict__ corrTime, // [numCodes][fftSize], unnormalized IFFT output
     int fftSize,
-    int validStart,   // = L - 1
-    int validLen,      // = fftSize - validStart = M
+    int validStart,   // = 0  (cross-correlation: valid = FIRST M samples)
+    int validLen,      // = M  (= fftSize - codeLen + 1)
     float* __restrict__ peakMag,
     int* __restrict__ peakLag,
     float normFactor)  // 1/fftSize (cuFFT does not normalize the inverse transform)
@@ -225,7 +225,7 @@ void GpuCorrelatorBank::processBlock(const cufftComplex* h_blockInput, float* ou
     int threads = 256;
     size_t shmem = threads * (sizeof(float) + sizeof(int));
     peakSearchKernel<<<numCodes, threads, shmem, stream>>>(
-        d_product, N, L - 1, M, d_peakMag, d_peakLag, 1.0f / N);
+        d_product, N, 0, M, d_peakMag, d_peakLag, 1.0f / N);
 
     CUDA_CHECK(cudaMemcpyAsync(outMag, d_peakMag, sizeof(float) * numCodes,
                                 cudaMemcpyDeviceToHost, stream));
@@ -252,8 +252,8 @@ void GpuCorrelatorBank::conjugateInPlace(cufftComplex* d_data, int n) {
 //
 // The values are the unnormalized cuFFT IFFT output (each true correlation
 // value is hostBuf[i] / N).  The valid linear-correlation region is
-// samples [L-1, N) (0-indexed); samples [0, L-1) are circular-wraparound
-// artefacts from the overlap-save algorithm and should be discarded.
+// samples [0, M) (0-indexed, M = N-L+1); samples [M, N) are circular-wraparound
+// artefacts from overlap-save (code uses conj(FFT(h)) = cross-correlation form).
 void GpuCorrelatorBank::getLastCorrelation(int codeIdx, cufftComplex* hostBuf) const {
     if (codeIdx < 0 || codeIdx >= numCodes) {
         throw std::out_of_range("getLastCorrelation: codeIdx out of range");
