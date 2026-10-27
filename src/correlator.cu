@@ -3,11 +3,11 @@
 // GPU matched-filter bank correlator using overlap-save FFT correlation.
 //
 // Design:
-//   - N reference codes (PN codes, etc.), each of length L samples, are
+//   - N reference codes (PN codes, etc.), each of length M samples, are
 //     zero-padded to FFT size and their FFTs precomputed ONCE at startup
 //     (conjugated, ready for multiply).
-//   - Each incoming block of input samples (length M = FFT_SIZE - L + 1
-//     "new" samples, overlapped with the previous L-1 samples) is forward
+//   - Each incoming block of input samples (length L = N - M + 1
+//     new samples, overlapped with the previous M-1 samples) is forward
 //     FFT'd ONCE.
 //   - That single spectrum is broadcast-multiplied against every code's
 //     conjugated spectrum (batched complex multiply), then a single batched
@@ -74,14 +74,15 @@ __global__ void batchedComplexMultiplyKernel(
 }
 
 // Per-code peak-magnitude search over the "valid" (non-wraparound)
-// portion of the overlap-save output: first M samples [0, M) are valid
-// for cross-correlation (conj(FFT(h)) form). One block per code; block-wide
-// reduction in shared memory.
+// portion of the overlap-save output.  In overlap-save the valid region is
+// the LAST L samples: indices [M-1, N-1] (Proakis eq. 7.3.9).
+// The first M-1 samples are circular-wraparound artefacts and must be skipped.
+// One block per code; block-wide reduction in shared memory.
 __global__ void peakSearchKernel(
     const cufftComplex* __restrict__ corrTime, // [numCodes][fftSize], unnormalized IFFT output
     int fftSize,
-    int validStart,   // = 0  (cross-correlation: valid = FIRST M samples)
-    int validLen,      // = M  (= fftSize - codeLen + 1)
+    int validStart,   // = M-1  (Proakis: discard first M-1 aliased samples)
+    int validLen,      // = L  (= N - M + 1, new data points per block)
     float* __restrict__ peakMag,
     int* __restrict__ peakLag,
     float normFactor)  // 1/fftSize (cuFFT does not normalize the inverse transform)
@@ -132,12 +133,12 @@ __global__ void peakSearchKernel(
 // ---------------------------------------------------------------------
 
 GpuCorrelatorBank::GpuCorrelatorBank(int codeLen, int fftSize, int numCodesIn)
-    : L(codeLen), N(fftSize), numCodes(numCodesIn)
+    : M(codeLen), N(fftSize), numCodes(numCodesIn)
 {
-    if (N < 2 * L - 1) {
+    if (N < 2 * M - 1) {
         throw std::runtime_error("fftSize must be >= 2*codeLen-1 for overlap-save");
     }
-    M = N - L + 1; // valid new samples per block
+    L = N - M + 1; // new data points per block (Proakis L)
 
     CUDA_CHECK(cudaMalloc(&d_codeSpectraConj, sizeof(cufftComplex) * (size_t)N * numCodes));
     CUDA_CHECK(cudaMalloc(&d_inputTime,       sizeof(cufftComplex) * N));
@@ -174,18 +175,18 @@ GpuCorrelatorBank::~GpuCorrelatorBank() {
 }
 
 int GpuCorrelatorBank::fftSize() const { return N; }
-int GpuCorrelatorBank::validLen() const { return M; }
-int GpuCorrelatorBank::codeLen() const { return L; }
+int GpuCorrelatorBank::blockLen() const { return L; }
+int GpuCorrelatorBank::codeLen() const { return M; }
 int GpuCorrelatorBank::bankSize() const { return numCodes; }
 
-// Load one reference code (host-side complex float array of length L).
+// Load one reference code (host-side complex float array of length M).
 // Zero-pads to N, forward-FFTs it, conjugates it, and stores it in the
 // code bank at slot `idx`. Call once per code at startup.
 void GpuCorrelatorBank::loadCode(int idx, const cufftComplex* hostCode) {
     cufftComplex* d_scratch;
     CUDA_CHECK(cudaMalloc(&d_scratch, sizeof(cufftComplex) * N));
     CUDA_CHECK(cudaMemset(d_scratch, 0, sizeof(cufftComplex) * N));
-    CUDA_CHECK(cudaMemcpy(d_scratch, hostCode, sizeof(cufftComplex) * L, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scratch, hostCode, sizeof(cufftComplex) * M, cudaMemcpyHostToDevice));
 
     cufftHandle tmpPlan;
     CUFFT_CHECK(cufftPlan1d(&tmpPlan, N, CUFFT_C2C, 1));
@@ -200,8 +201,8 @@ void GpuCorrelatorBank::loadCode(int idx, const cufftComplex* hostCode) {
 }
 
 // Process one overlap-save block. `h_blockInput` must point to N
-// time-domain samples in HOST pinned memory (the last L-1 samples
-// of the previous block followed by M new samples) — see host loop
+// time-domain samples in HOST pinned memory (the last M-1 samples
+// of the previous block followed by L new samples) — see host loop
 // for how the ring buffer maintains this overlap.
 // Using cudaMemcpyHostToDevice (not DeviceToDevice) ensures the GPU
 // sees the CPU's freshly written samples through the cache-coherent
@@ -225,7 +226,7 @@ void GpuCorrelatorBank::processBlock(const cufftComplex* h_blockInput, float* ou
     int threads = 256;
     size_t shmem = threads * (sizeof(float) + sizeof(int));
     peakSearchKernel<<<numCodes, threads, shmem, stream>>>(
-        d_product, N, 0, M, d_peakMag, d_peakLag, 1.0f / N);
+        d_product, N, M - 1, L, d_peakMag, d_peakLag, 1.0f / N);
 
     CUDA_CHECK(cudaMemcpyAsync(outMag, d_peakMag, sizeof(float) * numCodes,
                                 cudaMemcpyDeviceToHost, stream));
@@ -252,7 +253,7 @@ void GpuCorrelatorBank::conjugateInPlace(cufftComplex* d_data, int n) {
 //
 // The values are the unnormalized cuFFT IFFT output (each true correlation
 // value is hostBuf[i] / N).  The valid linear-correlation region is
-// samples [0, M) (0-indexed, M = N-L+1); samples [M, N) are circular-wraparound
+// samples [M-1, N-1] (0-indexed, Proakis: M=filter duration, L=N-M+1 new samples);
 // artefacts from overlap-save (code uses conj(FFT(h)) = cross-correlation form).
 void GpuCorrelatorBank::getLastCorrelation(int codeIdx, cufftComplex* hostBuf) const {
     if (codeIdx < 0 || codeIdx >= numCodes) {

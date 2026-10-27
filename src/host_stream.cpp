@@ -97,14 +97,17 @@ static int nextPow2(int n) {
 
 int main(int argc, char** argv) {
     // ---------------- Configuration ----------------
-    // Usage: correlator <sample_rate_hz>
+    // Usage: correlator <sample_rate_hz> <num_codes>
     //   sample_rate_hz — bladeRF RX sample rate in samples/second.
     //                    The RX bandwidth is set to the same value.
-    //   Example: ./correlator 6000000    (6 Msps)
-    //            ./correlator 10000000   (10 Msps)
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <sample_rate_hz>\n", argv[0]);
-        fprintf(stderr, "  example: %s 6000000\n", argv[0]);
+    //   num_codes      — number of PN codes to correlate against.
+    //                    In normal mode: must be <= numCodesInTable (from prn_templates.hpp).
+    //                    In TIMING_BENCHMARK mode: any positive integer; zero-filled templates.
+    //   Example: ./correlator 6000000 35    (6 Msps, 35 codes)
+    //            ./correlator 10000000 10   (10 Msps, 10 codes)
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <sample_rate_hz> <num_codes>\n", argv[0]);
+        fprintf(stderr, "  example: %s 6000000 35\n", argv[0]);
         return 1;
     }
     char* endptr = nullptr;
@@ -115,14 +118,42 @@ int main(int argc, char** argv) {
     }
     const unsigned int sampleRate = static_cast<unsigned int>(sampleRateArg);
 
+    char* endptr2 = nullptr;
+    const long long numCodesArg = std::strtoll(argv[2], &endptr2, 10);
+    if (endptr2 == argv[2] || *endptr2 != '\0' || numCodesArg <= 0) {
+        fprintf(stderr, "Error: num_codes must be a positive integer, got '%s'\n", argv[2]);
+        return 1;
+    }
+
     const uint64_t     centerFreq = 435000000ULL; // set to your band
     const int          rxGainDb   = 10;
     const bladerf_channel rxChan  = BLADERF_CHANNEL_RX(0);
 
-    //const int codeLen  = TEMPLATE_LEN;         // upsampled, pulse-shaped template length
-    const int codeLen  = TEMPLATE_LEN;         // upsampled, pulse-shaped template length
-    const int fftSize  = 65536; // fixed to match MATLAB N (must be >= 2*codeLen-1 = 24551)
-    const int numCodes = numCodesInTable;      // size of the PN code bank, from prnTemplateTable above
+    // codeLen: in TIMING_BENCHMARK mode, compute from sample rate so N and L
+    // scale correctly without recompiling.  In normal mode, use the compile-time
+    // TEMPLATE_LEN from prn_templates.hpp (which must match the hardware sample rate).
+    // Reference: 24552 samples at 6 Msps (the baseline rate used when generating
+    // the pulse-shaped templates); scale linearly for other rates.
+#ifdef TIMING_BENCHMARK
+    const int codeLen  = static_cast<int>(std::round(24552.0 * sampleRate / 6000000.0));
+#else
+    const int codeLen  = TEMPLATE_LEN; // upsampled, pulse-shaped template length
+#endif
+    // fftSize: smallest power-of-two >= 2*codeLen-1 (overlap-save requirement).
+    // Previously hardcoded to 65536; now derived from codeLen so benchmark sweeps
+    // across sample rates automatically pick the correct FFT size.
+    const int fftSize  = nextPow2(2 * codeLen - 1);
+
+    // numCodes: from command-line argument.  In normal mode validate against the
+    // table size so we never overrun prnTemplateTable[].
+    const int numCodes = static_cast<int>(numCodesArg);
+#ifndef TIMING_BENCHMARK
+    if (numCodes > numCodesInTable) {
+        fprintf(stderr, "Error: num_codes=%d exceeds numCodesInTable=%d in prn_templates.hpp\n",
+                numCodes, numCodesInTable);
+        return 1;
+    }
+#endif
 
     std::signal(SIGINT, handleSigint);
 
@@ -180,23 +211,31 @@ int main(int argc, char** argv) {
     // ---------------- GPU correlator bank ----------------
     GpuCorrelatorBank bank(codeLen, fftSize, numCodes);
 
-    // Load the code bank from prnTemplateTable (defined above main()).
-    // loadCode() zero-pads each template to fftSize, forward FFTs it,
-    // conjugates it, and stores it — this happens once at startup, not
-    // per block. No chip synthesis or pulse shaping happens here; these
-    // are already your transmitter's actual pulse-shaped waveforms.
+    // Load the code bank.  loadCode() zero-pads each template to fftSize,
+    // forward FFTs it, conjugates it, and stores it — once at startup.
+    // In TIMING_BENCHMARK mode all templates are zero-filled (timing is
+    // independent of template content); in normal mode, the first numCodes
+    // rows of prnTemplateTable[] (pulse-shaped waveforms) are used.
+#ifdef TIMING_BENCHMARK
+    {
+        std::vector<cufftComplex> zeroCode(codeLen, {0.f, 0.f});
+        for (int i = 0; i < numCodes; ++i)
+            bank.loadCode(i, zeroCode.data());
+    }
+#else
     for (int i = 0; i < numCodes; ++i) {
         std::vector<cufftComplex> code = templateToComplex(prnTemplateTable[i], codeLen);
         bank.loadCode(i, code.data());
     }
+#endif
 
-    const int M = bank.validLen(); // new samples consumed per block
-    const int L = bank.codeLen();
+    const int L = bank.blockLen(); // new data points per block (Proakis L; L = N-M+1)
+    const int M = bank.codeLen(); // filter duration / code length (Proakis M)
     const int N = bank.fftSize();
 
-    // Ring buffer holding N samples: [L-1 history][M new]. After each
-    // block we shift the last L-1 samples to the front for the next
-    // block's history (classic overlap-save bookkeeping).
+    // Ring buffer holding N samples: [M-1 history | L new].  After each
+    // block we shift the last M-1 samples to the front for the next
+    // block's history (classic overlap-save bookkeeping, Proakis §7.3.2).
     cufftComplex* h_ring = nullptr;
     // Plain pinned memory — processBlock() uses cudaMemcpyHostToDevice so
     // the GPU sees the CPU's freshly written samples through the coherent
@@ -209,7 +248,7 @@ int main(int argc, char** argv) {
 
     // SC16Q11 staging buffer for one block's worth of new samples
     // (interleaved I/Q, 2 int16 per complex sample).
-    std::vector<int16_t> sc16Buf((size_t)M * 2);
+    std::vector<int16_t> sc16Buf((size_t)L * 2);
 
     std::vector<float> peakMag(numCodes);
     std::vector<int>   peakLag(numCodes);
@@ -220,7 +259,7 @@ int main(int argc, char** argv) {
     // invN: the normalization factor; cuFFT C2C inverse does NOT divide by N.
     const float invN = 1.0f / static_cast<float>(N);
     std::vector<cufftComplex> corrBuf((size_t)N);
-    std::vector<float>        f32CorrBuf((size_t)M * 2);
+    std::vector<float>        f32CorrBuf((size_t)L * 2);
 
     // -----------------------------------------------------------------
     // Binary capture files for offline verification of the GPU correlator.
@@ -235,12 +274,12 @@ int main(int argc, char** argv) {
     //
     // corr_c##_capture.bin   — GPU correlator output for code ##, written
     //                          as complex float32 (NOT SC16_Q11).  For
-    //                          each block the M valid lags [0, M) of
+    //                          each block the L valid lags [0, L) of
     //                          the IFFT output are normalised by N and
     //                          written as pairs of IEEE-754 float32
     //                          [I0, Q0, I1, Q1, ...].
     //                          Lag k of block b is at byte offset
-    //                          (b*M + k) * 8 in the file.
+    //                          (b*L + k) * 8 in the file.
     //
     //                          NOTE: the templates in prnTemplateTable are
     //                          at SC16_Q11 scale (values up to ~±1000),
@@ -274,15 +313,26 @@ int main(int argc, char** argv) {
     auto captureStart = std::chrono::steady_clock::now();
 
     printf("Capture mode: recording %.0f s of data to SC16_Q11 binary files.\n"
-           "  fftSize=%d  codeLen=%d  validLen(M)=%d  bank=%d codes\n"
+           "  N=%d  M(codeLen)=%d  L(blockLen)=%d  bank=%d codes\n"
            "  raw_capture.bin + corr_c##_capture.bin (one per code)\n",
-           CAPTURE_DURATION_S, N, L, M, numCodes);
+           CAPTURE_DURATION_S, N, M, L, numCodes);
 #else
     // ---- continuous mode: no files, run until SIGINT ---------------------
-    printf("Continuous mode (no file output). fftSize=%d  codeLen=%d  "
-           "validLen(M)=%d  bank=%d codes\n"
+#ifdef TIMING_BENCHMARK
+#  ifndef BENCHMARK_BLOCKS
+#    define BENCHMARK_BLOCKS 1000
+#  endif
+    printf("TIMING BENCHMARK MODE. N=%d  M(codeLen)=%d  "
+           "L(blockLen)=%d  bank=%d codes  blocks=%d\n"
+           "  budget=%.3f ms  Running...\n",
+           N, M, L, numCodes, BENCHMARK_BLOCKS,
+           1000.0 * L / sampleRate);
+#else
+    printf("Continuous mode (no file output). N=%d  M(codeLen)=%d  "
+           "L(blockLen)=%d  bank=%d codes\n"
            "  Press Ctrl-C to stop.\n",
-           N, L, M, numCodes);
+           N, M, L, numCodes);
+#endif
 #endif
 
     // Buffer count since the last timestamp grab (the one above, or the
@@ -307,19 +357,54 @@ int main(int argc, char** argv) {
 
     static constexpr int STAT_INTERVAL = 100; // blocks between reports
     struct {
-        double rx_ms = 0, conv_ms = 0, proc_ms = 0, total_ms = 0;
-        double rx_max = 0, proc_max = 0, total_max = 0;
+        // Per-interval accumulators — reset every STAT_INTERVAL blocks.
+        // rx_ms:    time bladerf_sync_rx blocked (≈ budget when keeping up)
+        // gpu_ms:   time for processBlock() — forward FFT, multiply, IFFT, peak search
+        // cpu_ms:   SC16→float32 conversion + detection loop + memmove
+        // total_ms: gpu_ms + cpu_ms  (processing work that must fit within budget)
+        double rx_ms = 0, gpu_ms = 0, cpu_ms = 0, total_ms = 0;
+        double rx_max = 0, gpu_max = 0, cpu_max = 0, total_max = 0;
         int    count  = 0;
-        int    bladerf_errors = 0; // SDR rx failures in this interval
+        // Lifetime accumulators — never reset; used for benchmark summary.
+        double lt_rx_ms = 0, lt_gpu_ms = 0, lt_cpu_ms = 0, lt_total_ms = 0;
+        double lt_rx_max = 0, lt_gpu_max = 0, lt_cpu_max = 0, lt_total_max = 0;
+        int    lt_count = 0;
+        int    bladerf_errors = 0; // cumulative SDR rx failures
         FILE*  csv    = nullptr; // kept across reset()
-        void reset() { FILE* f = csv; *this = {}; csv = f; }
-        void accumulate(double rx, double cv, double pr, double tot) {
-            rx_ms   += rx;  conv_ms  += cv;
-            proc_ms += pr;  total_ms += tot;
-            if (rx   > rx_max)    rx_max    = rx;
-            if (pr   > proc_max)  proc_max  = pr;
-            if (tot  > total_max) total_max = tot;
+        void reset() {
+            // Preserve lifetime fields, csv pointer, and error count.
+            FILE*  f    = csv;
+            double lrx  = lt_rx_ms,   lgpu  = lt_gpu_ms,
+                   lcpu = lt_cpu_ms,  ltot  = lt_total_ms;
+            double lrxmx = lt_rx_max, lgmx  = lt_gpu_max,
+                   lcmx = lt_cpu_max, ltmx  = lt_total_max;
+            int    lc   = lt_count,   le    = bladerf_errors;
+            *this = {};
+            csv = f;
+            lt_rx_ms  = lrx;   lt_gpu_ms  = lgpu;
+            lt_cpu_ms = lcpu;  lt_total_ms = ltot;
+            lt_rx_max = lrxmx; lt_gpu_max  = lgmx;
+            lt_cpu_max = lcmx; lt_total_max = ltmx;
+            lt_count = lc;  bladerf_errors = le;
+        }
+        void accumulate(double rx, double gpu, double cpu) {
+            double tot = gpu + cpu;
+            // Per-interval
+            rx_ms    += rx;  gpu_ms   += gpu;
+            cpu_ms   += cpu; total_ms += tot;
+            if (rx  > rx_max)    rx_max    = rx;
+            if (gpu > gpu_max)   gpu_max   = gpu;
+            if (cpu > cpu_max)   cpu_max   = cpu;
+            if (tot > total_max) total_max = tot;
             ++count;
+            // Lifetime
+            lt_rx_ms  += rx;  lt_gpu_ms  += gpu;
+            lt_cpu_ms += cpu; lt_total_ms += tot;
+            if (rx  > lt_rx_max)    lt_rx_max    = rx;
+            if (gpu > lt_gpu_max)   lt_gpu_max   = gpu;
+            if (cpu > lt_cpu_max)   lt_cpu_max   = cpu;
+            if (tot > lt_total_max) lt_total_max = tot;
+            ++lt_count;
         }
         // Write one CSV row for a bladeRF rx failure.  Timing fields are
         // empty; the error string goes in the note column so the row is
@@ -328,12 +413,12 @@ int main(int argc, char** argv) {
                          double budget_ms, const char* msg) {
             if (!csv) return;
             fprintf(csv,
-                "%.1f,0,%u,%d,%d"  // elapsed + sentinel block count
+                "%.1f,0,%.2f,%d,%d"  // elapsed + sentinel block count
                 ",%.4f"
-                ",,,,,,,,,"        // rx/conv/proc/total/headroom all blank
+                ",,,,,,,,,,"       // rx/gpu/cpu/total/margin all blank
                 "%d"               // bladerf_errors = 1 for this row
                 ",\"bladerf_error: %s\"\n",
-                elapsed_s, sr / 1000000u, nc, N_val,
+                elapsed_s, (double)sr / 1e6, nc, N_val,
                 budget_ms,
                 1, msg);
             fflush(csv);
@@ -341,45 +426,95 @@ int main(int argc, char** argv) {
         }
         // Write one CSV row for a periodic timing report.
         // elapsed_s is wall-clock seconds since the main loop started.
-        void report(double budget_ms, int M_val, int N_val,
+        void report(double budget_ms, int L_val, int N_val,
                     unsigned sr, int nc, double elapsed_s) const {
             if (!csv) return;
-            double n        = count ? count : 1;
-            double headroom = budget_ms - total_ms / n;
+            double n      = count ? count : 1;
+            double margin = budget_ms - total_ms / n;
             fprintf(csv,
-                "%.1f,%d,%u,%d,%d"
+                "%.1f,%d,%.2f,%d,%d"
                 ",%.4f"
                 ",%.4f,%.4f"
-                ",%.4f"
+                ",%.4f,%.4f"
                 ",%.4f,%.4f"
                 ",%.4f,%.4f"
                 ",%.4f,%.2f"
                 ",%d,"             // bladerf_errors, empty note
                 "\n",
-                elapsed_s, count, sr / 1000000u, nc, N_val,
+                elapsed_s, count, (double)sr / 1e6, nc, N_val,
                 budget_ms,
                 rx_ms / n, rx_max,
-                conv_ms / n,
-                proc_ms / n, proc_max,
+                gpu_ms / n, gpu_max,
+                cpu_ms / n, cpu_max,
                 total_ms / n, total_max,
-                headroom, 100.0 * headroom / budget_ms,
+                margin, 100.0 * margin / budget_ms,
                 bladerf_errors);
             fflush(csv);
             // Brief terminal line so the operator knows it's alive.
-            const char* flag = (headroom < 0) ? " *** OVERRUN ***"
+            const char* flag = (margin < 0)           ? " *** OVERRUN ***"
                              : (total_max > budget_ms) ? " (worst-case overrun)"
                              : (bladerf_errors > 0)    ? " (bladeRF errors)"
                              : "";
-            printf("[t=%6.0fs] headroom %+.2f ms (%.1f%% of %.2f ms budget)%s\n",
-                   elapsed_s, headroom, 100.0 * headroom / budget_ms,
+            printf("[t=%6.0fs] margin %+.2f ms (%.1f%% of %.2f ms budget)%s\n",
+                   elapsed_s, margin, 100.0 * margin / budget_ms,
                    budget_ms, flag);
         }
+#ifdef TIMING_BENCHMARK
+        // Write a final summary row tagged "BENCHMARK_SUMMARY" and print
+        // a clean terminal report averaged over all lt_count blocks.
+        void report_benchmark(double budget_ms, int N_val,
+                              unsigned sr, int nc, double elapsed_s) const {
+            double n      = lt_count ? (double)lt_count : 1.0;
+            double margin = budget_ms - lt_total_ms / n;
+            if (csv) {
+                fprintf(csv,
+                    "%.1f,%d,%.2f,%d,%d"
+                    ",%.4f"
+                    ",%.4f,%.4f"
+                    ",%.4f,%.4f"
+                    ",%.4f,%.4f"
+                    ",%.4f,%.4f"
+                    ",%.4f,%.2f"
+                    ",%d,\"BENCHMARK_SUMMARY\""
+                    "\n",
+                    elapsed_s, lt_count, (double)sr / 1e6, nc, N_val,
+                    budget_ms,
+                    lt_rx_ms  / n, lt_rx_max,
+                    lt_gpu_ms / n, lt_gpu_max,
+                    lt_cpu_ms / n, lt_cpu_max,
+                    lt_total_ms / n, lt_total_max,
+                    margin, 100.0 * margin / budget_ms,
+                    bladerf_errors);
+                fflush(csv);
+            }
+            const char* verdict = (margin < 0)               ? "OVERRUN"
+                                : (lt_total_max > budget_ms) ? "MARGINAL (worst-case overrun)"
+                                : "OK";
+            printf("\n=== TIMING BENCHMARK SUMMARY (%d blocks) ===\n", lt_count);
+            printf("  config      : %u MSPS  %d codes  N=%d\n",
+                   sr / 1000000u, nc, N_val);
+            printf("  budget      : %.3f ms\n", budget_ms);
+            printf("  rx   mean   : %.3f ms  (max %.3f ms)\n",
+                   lt_rx_ms / n, lt_rx_max);
+            printf("  gpu  mean   : %.3f ms  (max %.3f ms)\n",
+                   lt_gpu_ms / n, lt_gpu_max);
+            printf("  cpu  mean   : %.3f ms  (max %.3f ms)\n",
+                   lt_cpu_ms / n, lt_cpu_max);
+            printf("  total mean  : %.3f ms  (max %.3f ms)\n",
+                   lt_total_ms / n, lt_total_max);
+            printf("  margin      : %+.3f ms  (%.1f%% of budget)\n",
+                   margin, 100.0 * margin / budget_ms);
+            printf("  bladeRF err : %d\n", bladerf_errors);
+            printf("  verdict     : %s\n", verdict);
+            printf("============================================\n\n");
+        }
+#endif // TIMING_BENCHMARK
     } stats;
 
-    const double block_budget_ms = 1000.0 * M / sampleRate;
+    const double block_budget_ms = 1000.0 * L / sampleRate;
 
     // Detection threshold for correlation peaks.
-    // peakMag[c] = max(|corr[k]| / N) over the M valid lags.
+    // peakMag[c] = max(|corr[k]| / N) over the L valid lags.
     // Set this empirically from observed noise-floor values in
     // detections.csv; 0.10 is a reasonable starting point.
     constexpr float DETECTION_THRESHOLD = 20000.0f;
@@ -394,10 +529,10 @@ int main(int argc, char** argv) {
                 "elapsed_s,blocks,sample_rate_msps,num_codes,fft_size"
                 ",block_budget_ms"
                 ",rx_mean_ms,rx_max_ms"
-                ",conv_mean_ms"
-                ",proc_mean_ms,proc_max_ms"
+                ",gpu_mean_ms,gpu_max_ms"
+                ",cpu_mean_ms,cpu_max_ms"
                 ",total_mean_ms,total_max_ms"
-                ",headroom_ms,headroom_pct"
+                ",margin_ms,margin_pct"
                 ",bladerf_errors,note"
                 "\n");
             fflush(stats.csv);
@@ -418,7 +553,7 @@ int main(int argc, char** argv) {
 
     while (!g_stop) {
         auto tLoopStart = std::chrono::steady_clock::now();
-        status = bladerf_sync_rx(dev, sc16Buf.data(), (unsigned int)M, nullptr, timeoutMs);
+        status = bladerf_sync_rx(dev, sc16Buf.data(), (unsigned int)L, nullptr, timeoutMs);
         if (status != 0) {
             // Log the failure to the CSV immediately (don't wait for the next
             // periodic report) so the exact block and timestamp are recorded.
@@ -441,26 +576,26 @@ int main(int argc, char** argv) {
         // Write raw SC16_Q11 samples to the capture file before conversion.
         // sc16Buf holds exactly M interleaved int16_t I/Q pairs straight
         // from libbladeRF — this is the byte-identical wire format.
-        fwrite(sc16Buf.data(), sizeof(int16_t), (size_t)M * 2, rawFile);
+        fwrite(sc16Buf.data(), sizeof(int16_t), (size_t)L * 2, rawFile);
 #endif
 
         // Convert SC16Q11 -> float32 directly into the mapped ring buffer
-        // (the GPU-visible "new samples" region, after the L-1 history).
-        cufftComplex* newSamples = h_ring + (L - 1);
+        // (the GPU-visible "new samples" region, after the M-1 history).
+        cufftComplex* newSamples = h_ring + (M - 1);
         const float scale = 1.0f / 2048.0f; // Q11
-        for (int n = 0; n < M; ++n) {
+        for (int n = 0; n < L; ++n) {
             newSamples[n].x = sc16Buf[2 * n]     * scale;
             newSamples[n].y = sc16Buf[2 * n + 1] * scale;
         }
 
-        // Push the M new float32 samples into the IQ history ring buffer
+        // Push the L new float32 samples into the IQ history ring buffer
         // before processBlock so detection logic can read them by absolute
         // stream position.
-        for (int n = 0; n < M; ++n) {
+        for (int n = 0; n < L; ++n) {
             g_iqHistory[g_histHead] = newSamples[n];
             if (++g_histHead == HIST_SAMPLES) g_histHead = 0;
         }
-        g_histTotal += M;
+        g_histTotal += L;
         auto tAfterConv = std::chrono::steady_clock::now();
 #ifdef WRITE_CAPTURE_FILES
         // DIAGNOSTIC: dump h_ring for first few blocks, compare with MATLAB
@@ -479,17 +614,17 @@ int main(int argc, char** argv) {
 
         // Detection: check each code's peak against the threshold.
         // stream_sample is the absolute 0-based sample index of the peak
-        // in the full incoming stream: g_histTotal was incremented by M
-        // above, so the current block's M samples live at
-        // [g_histTotal-M, g_histTotal-1] and the peak at lag k is at
-        // position g_histTotal - M + k.
+        // in the full incoming stream: g_histTotal was incremented by L
+        // above, so the current block's L samples live at
+        // [g_histTotal-L, g_histTotal-1] and the peak at lag k is at
+        // position g_histTotal - L + k.
         if (detFile) {
             double det_elapsed = std::chrono::duration<double>(
                 tAfterProc - loopEpoch).count();
             for (int c = 0; c < numCodes; ++c) {
                 if (peakMag[c] > DETECTION_THRESHOLD) {
                     long long streamPos =
-                        static_cast<long long>(g_histTotal) - M + peakLag[c];
+                        static_cast<long long>(g_histTotal) - L + peakLag[c];
                     fprintf(detFile,
                         "%.3f,%u,%d,%.6f,%d,%lld\n",
                         det_elapsed, bufferNum, c,
@@ -508,40 +643,48 @@ int main(int argc, char** argv) {
         // (corrBuf and f32CorrBuf are allocated once before the loop.)
         for (int c = 0; c < numCodes; ++c) {
             // Copy the full IFFT row for this code to the host.
-            // Valid lags are at indices [0, M) for cross-correlation;
-            // samples [M, N) are circular-wraparound artefacts from
-            // overlap-save and are discarded.
+            // In overlap-save the VALID region is [M-1, N-1] (= the last L
+            // samples, Proakis eq. 7.3.9).  The first M-1 = codeLen-1
+            // samples are circular-wraparound artefacts and must be skipped.
             bank.getLastCorrelation(c, corrBuf.data());
 
-            for (int k = 0; k < M; ++k) {
-                const cufftComplex& s = corrBuf[(size_t)k];
+            for (int k = 0; k < L; ++k) {
+                const cufftComplex& s = corrBuf[(size_t)(M - 1 + k)];
                 f32CorrBuf[2 * k]     = s.x * invN;
                 f32CorrBuf[2 * k + 1] = s.y * invN;
             }
-            fwrite(f32CorrBuf.data(), sizeof(float), (size_t)M * 2, corrFiles[c]);
+            fwrite(f32CorrBuf.data(), sizeof(float), (size_t)L * 2, corrFiles[c]);
         }
 #endif
 
+        // Overlap-save bookkeeping: shift the last M-1 samples of this
+        // block to the front of the ring buffer as history for the next
+        // block's forward FFT window (Proakis §7.3.2).
+        std::memmove(h_ring, h_ring + L, sizeof(cufftComplex) * (M - 1));
+        auto tAfterMemmove = std::chrono::steady_clock::now();
+
         // Accumulate timing for this block.
+        //   gpu_ms  = processBlock (FFT bank + multiply + IFFT + peak search)
+        //   cpu_ms  = SC16→float32 conversion + detection loop + memmove
+        //   total   = gpu + cpu  (must fit within block_budget_ms)
+        //   margin  = block_budget_ms - total
         {
-            auto tEnd = std::chrono::steady_clock::now();
             using ms = std::chrono::duration<double, std::milli>;
-            stats.accumulate(
-                ms(tAfterRx   - tLoopStart).count(),
-                ms(tAfterConv - tAfterRx).count(),
-                ms(tAfterProc - tAfterConv).count(),
-                ms(tEnd       - tLoopStart).count()
-            );
+            double rx_ms  = ms(tAfterRx      - tLoopStart).count();
+            double gpu_ms = ms(tAfterProc    - tAfterConv).count();
+            double cpu_ms = ms(tAfterConv    - tAfterRx).count()      // SC16 convert
+                          + ms(tAfterMemmove - tAfterProc).count();   // detect + memmove
+            stats.accumulate(rx_ms, gpu_ms, cpu_ms);
             if (stats.count >= STAT_INTERVAL) {
                 double elapsed_s = std::chrono::duration<double>(
-                    tEnd - loopEpoch).count();
-                stats.report(block_budget_ms, M, N, sampleRate, numCodes, elapsed_s);
+                    tAfterMemmove - loopEpoch).count();
+                stats.report(block_budget_ms, L, N, sampleRate, numCodes, elapsed_s);
                 stats.reset();
             }
         }
 
         // Progress display.  peakMag[] is filled by peakSearchKernel and
-        // represents max(|corr[k]| / N) over the M valid lags.
+        // represents max(|corr[k]| / N) over the L valid lags.
 #ifdef WRITE_CAPTURE_FILES
         // Capture mode: print every 50 blocks and stop after CAPTURE_DURATION_S.
         if (bufferNum % 50 == 0) {
@@ -567,13 +710,20 @@ int main(int argc, char** argv) {
         }
 #endif
 
-        // Overlap-save bookkeeping: shift the last L-1 samples of this
-        // block to the front of the ring buffer as history for the next
-        // block's forward FFT window.
-        std::memmove(h_ring, h_ring + M, sizeof(cufftComplex) * (L - 1));
-
         ++bufferNum;
+#ifdef TIMING_BENCHMARK
+        if (bufferNum >= BENCHMARK_BLOCKS) break;
+#endif
+    } //End of main while loop
+
+#ifdef TIMING_BENCHMARK
+    {
+        double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - loopEpoch).count();
+        stats.report_benchmark(block_budget_ms, N, sampleRate,
+                               numCodes, elapsed_s);
     }
+#endif
 
     if (stats.csv) { fclose(stats.csv); stats.csv = nullptr; }
     if (detFile)   { fclose(detFile);   detFile   = nullptr; }
@@ -588,7 +738,11 @@ int main(int argc, char** argv) {
            std::chrono::duration<double>(
                std::chrono::steady_clock::now() - captureStart).count());
 #else
+#ifdef TIMING_BENCHMARK
+    printf("Benchmark complete: %u blocks.\n", bufferNum);
+#else
     printf("Stopped after %u blocks.\n", bufferNum);
+#endif
 #endif
     return 0;
 }
